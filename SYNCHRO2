@@ -1,0 +1,387 @@
+#define _CRT_SECURE_NO_WARNINGS
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <conio.h>
+#include <windows.h>
+
+// ── 시리얼 포트 ──────────────────────────────
+#define SERIAL_PORT "COM4"
+#define SERIAL_BAUD  CBR_9600
+
+static HANDLE hSerial = INVALID_HANDLE_VALUE;
+
+int serial_open(void) {
+
+    hSerial = CreateFileA(
+        SERIAL_PORT,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+
+    if (hSerial == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "[WARN] 시리얼 포트 열기 실패: %s\n", SERIAL_PORT);
+        return 0;
+    }
+
+    // ===== 시리얼 설정 =====
+    DCB dcb = { 0 };
+
+    dcb.DCBlength = sizeof(dcb);
+
+    GetCommState(hSerial, &dcb);
+
+    dcb.BaudRate = SERIAL_BAUD;
+    dcb.ByteSize = 8;
+    dcb.StopBits = ONESTOPBIT;
+    dcb.Parity   = NOPARITY;
+
+    SetCommState(hSerial, &dcb);
+
+    // ===== 타임아웃 =====
+    COMMTIMEOUTS to = { 0 };
+
+    to.ReadIntervalTimeout       = 100;
+    to.ReadTotalTimeoutConstant  = 1000;
+    to.WriteTotalTimeoutConstant = 50;
+
+    SetCommTimeouts(hSerial, &to);
+
+    // ===== Arduino 초기화 대기 =====
+    Sleep(3000);
+
+    // ===== HELLO 전송 =====
+    char* hello = "HELLO\n";
+
+    DWORD written;
+
+    WriteFile(
+        hSerial,
+        hello,
+        (DWORD)strlen(hello),
+        &written,
+        NULL
+    );
+
+    // ===== OLED/LCD 패널 체크 시간 확보 =====
+    Sleep(6500);
+
+    printf("[INFO] 시리얼 포트 연결: %s\n", SERIAL_PORT);
+
+    return 1;
+}
+
+// ===== 상태 정의 =====
+#define STATE_MOVING  0
+#define STATE_DOOR    1
+#define STATE_IDLE    2
+
+void serial_send(int floor, int dir, double eta, int state) {
+    if (hSerial == INVALID_HANDLE_VALUE) return;
+
+    char buf[64];
+
+    int eta10 = (eta >= 0) ? (int)(eta * 10 + 0.5) : -1;
+
+    sprintf(buf, "F:%d,D:%d,E:%d,S:%d\n", floor, dir, eta10, state);
+
+    DWORD written;
+    WriteFile(hSerial, buf, (DWORD)strlen(buf), &written, NULL);
+}
+
+void serial_close(void) {
+    if (hSerial != INVALID_HANDLE_VALUE) {
+        CloseHandle(hSerial);
+        hSerial = INVALID_HANDLE_VALUE;
+    }
+}
+// ─────────────────────────────────────────────
+
+#define MAX_FLOORS  9
+#define MAX_REQS     5
+
+#define MOVE_TIME_REAL   1.5
+#define STOP_TIME_REAL   6.0
+#define MOVE_TIME_VISUAL 1500
+
+#define ETA_USER_FLOOR   8
+#define ETA_USER_DIR    -1
+
+typedef struct {
+    int call_floor;
+    int dest_floor;
+    int direction;
+    int picked_up;
+    int done;
+} Request;
+
+const char* dir_str(int dir) {
+    return (dir == 1) ? "상승" : "하강";
+}
+
+int has_remaining(Request* reqs, int count) {
+    for (int i = 0; i < count; i++)
+        if (!reqs[i].done) return 1;
+    return 0;
+}
+
+int pick_unique_floor(int* used, int uf_count) {
+    int f;
+    while (1) {
+        f = (rand() % MAX_FLOORS) + 1;
+        int dup = 0;
+        for (int i = 0; i < uf_count; i++)
+            if (used[i] == f) { dup = 1; break; }
+        if (!dup) return f;
+    }
+}
+
+Request make_random_req(int* used, int* uf_count) {
+    Request r;
+    r.call_floor = pick_unique_floor(used, *uf_count);
+    used[(*uf_count)++] = r.call_floor;
+    r.dest_floor = pick_unique_floor(used, *uf_count);
+    used[(*uf_count)++] = r.dest_floor;
+    r.direction  = (r.dest_floor > r.call_floor) ? 1 : -1;
+    r.picked_up  = 0;
+    r.done       = 0;
+    return r;
+}
+
+int next_target(Request* reqs, int count, int cur, int dir) {
+    int best = -1;
+    for (int i = 0; i < count; i++) {
+        if (reqs[i].done) continue;
+        int t = reqs[i].picked_up ? reqs[i].dest_floor : reqs[i].call_floor;
+        if (dir == 1 && t > cur) {
+            if (best == -1 || t < best) best = t;
+        } else if (dir == -1 && t < cur) {
+            if (best == -1 || t > best) best = t;
+        }
+    }
+    return best;
+}
+
+double predict_wait_time(Request* origin, int count, int cur, int dir) {
+    Request sim[MAX_REQS + 1];
+    for (int i = 0; i < count; i++) sim[i] = origin[i];
+
+    int ui = count;
+    sim[ui].call_floor = ETA_USER_FLOOR;
+    sim[ui].dest_floor = 1;
+    sim[ui].direction  = ETA_USER_DIR;
+    sim[ui].picked_up  = 0;
+    sim[ui].done       = 0;
+    int total = count + 1;
+
+    double elapsed = 0.0;
+    int safety = 0;
+
+    while (safety++ < 500) {
+        int target = next_target(sim, total, cur, dir);
+        if (target == -1) {
+            dir = -dir;
+            target = next_target(sim, total, cur, dir);
+            if (target == -1) break;
+        }
+
+        while (cur != target) {
+            cur += dir;
+            elapsed += MOVE_TIME_REAL;
+            int acted = 0;
+
+            for (int i = 0; i < total; i++) {
+                if (!sim[i].done && sim[i].picked_up && sim[i].dest_floor == cur) {
+                    sim[i].done = 1;
+                    acted = 1;
+                }
+            }
+            for (int i = 0; i < total; i++) {
+                if (!sim[i].done && !sim[i].picked_up &&
+                    sim[i].call_floor == cur && sim[i].direction == dir) {
+                    if (i == ui) return elapsed;
+                    sim[i].picked_up = 1;
+                    acted = 1;
+                }
+            }
+            if (acted) elapsed += STOP_TIME_REAL;
+
+            if (cur != target) {
+                int new_t = next_target(sim, total, cur, dir);
+                if (new_t != -1 && ((dir == 1 && new_t < target) || (dir == -1 && new_t > target)))
+                    target = new_t;
+            }
+        }
+    }
+    return -1.0;
+}
+
+int process_floor(Request* reqs, int count, int cur, int dir) {
+    int processed = 0;
+    for (int i = 0; i < count; i++) {
+        if (!reqs[i].done && reqs[i].picked_up && reqs[i].dest_floor == cur) {
+            reqs[i].done = 1;
+            printf("  >> person%d 하차\n", i);
+            processed++;
+        }
+    }
+    for (int i = 0; i < count; i++) {
+        if (!reqs[i].done && !reqs[i].picked_up &&
+            reqs[i].call_floor == cur && reqs[i].direction == dir) {
+            reqs[i].picked_up = 1;
+            printf("  >> person%d 탑승 (행선 층: %d층)\n", i, reqs[i].dest_floor);
+            processed++;
+        }
+    }
+    return processed;
+}
+
+void pickup_opposite(Request* reqs, int count, int cur, int dir) {
+    for (int i = 0; i < count; i++) {
+        if (!reqs[i].done && !reqs[i].picked_up &&
+            reqs[i].call_floor == cur && reqs[i].direction == dir) {
+            reqs[i].picked_up = 1;
+            printf("  >> person%d 탑승 (행선 층: %d층)\n", i, reqs[i].dest_floor);
+        }
+    }
+}
+
+// ===== 정차 처리 (문 열림 STATE 포함) =====
+void do_stop(int cur, int dir) {
+    // 문 열림 신호 전송
+    serial_send(cur, dir, 0.0, STATE_DOOR);
+
+    // STOP_TIME_REAL 동안 문 열린 상태 유지
+    for (int t = 0; t < (int)(STOP_TIME_REAL * 10); t++) {
+        serial_send(cur, dir, 0.0, STATE_DOOR);
+        Sleep(100);
+    }
+}
+
+int run_once(int park_floor) {
+    int cur = park_floor;
+    int dir = 1;
+    int total = 3;
+
+    Request reqs[MAX_REQS];
+    int used[MAX_FLOORS * 2];
+    int uf = 0;
+
+    for (int i = 0; i < 3; i++)
+        reqs[i] = make_random_req(used, &uf);
+
+    int up = 0, dn = 0;
+    for (int i = 0; i < total; i++) {
+        if (reqs[i].call_floor > cur) up++;
+        else if (reqs[i].call_floor < cur) dn++;
+    }
+    dir = (up >= dn) ? 1 : -1;
+
+    printf("\n[운행 시작]\n");
+    printf("현재 층: %d층 | 초기 방향: %s\n\n", cur, dir_str(dir));
+    printf("[초기 호출]\n");
+    for (int i = 0; i < total; i++)
+        printf("  person%d : %d층 호출 / %s / 행선 %d층\n",
+            i, reqs[i].call_floor, dir_str(reqs[i].direction), reqs[i].dest_floor);
+    printf("\n");
+
+    int moves = 0, stops = 0;
+
+    while (has_remaining(reqs, total)) {
+        if (_kbhit() && (_getch() & 0xDF) == 'Q') return -1;
+
+        int target = next_target(reqs, total, cur, dir);
+        if (target == -1) {
+            dir = -dir;
+            printf("[방향 전환] %s 방향\n\n", dir_str(dir));
+            pickup_opposite(reqs, total, cur, dir);
+            target = next_target(reqs, total, cur, dir);
+        }
+        if (target == -1) break;
+
+        while (cur != target) {
+            if (_kbhit() && (_getch() & 0xDF) == 'Q') return -1;
+
+            cur += dir;
+            moves++;
+
+            double wait = predict_wait_time(reqs, total, cur, dir);
+
+            if (wait >= 0)
+                printf("  %s 중: %2d층   [8층↓ ETA %5.1f초]\n", dir_str(dir), cur, wait);
+            else
+                printf("  %s 중: %2d층   [8층↓ ETA  ---  ]\n", dir_str(dir), cur);
+
+            serial_send(cur, dir, wait, STATE_MOVING);
+
+            Sleep(MOVE_TIME_VISUAL);
+
+            int mid_acted = 0;
+            for (int i = 0; i < total; i++) {
+                if (!reqs[i].done && reqs[i].picked_up && reqs[i].dest_floor == cur) {
+                    reqs[i].done = 1;
+                    printf("  >> person%d 하차\n", i);
+                    mid_acted = 1;
+                }
+            }
+            for (int i = 0; i < total; i++) {
+                if (!reqs[i].done && !reqs[i].picked_up &&
+                    reqs[i].call_floor == cur && reqs[i].direction == dir) {
+                    reqs[i].picked_up = 1;
+                    printf("  >> person%d 탑승 (행선 층: %d층)\n", i, reqs[i].dest_floor);
+                    mid_acted = 1;
+                }
+            }
+            if (mid_acted) {
+                stops++;
+                do_stop(cur, dir);
+                int new_t = next_target(reqs, total, cur, dir);
+                if (new_t == -1) break;
+                target = new_t;
+            }
+        }
+
+        if (!has_remaining(reqs, total)) break;
+
+        printf("\n[%d층 정차]\n", cur);
+        stops++;
+        process_floor(reqs, total, cur, dir);
+        printf("\n");
+
+        do_stop(cur, dir);
+    }
+
+    printf("[IDLE] 모든 요청 완료\n");
+    printf("----------------------------------------\n");
+
+    serial_send(cur, 0, -1.0, STATE_IDLE);
+
+    Sleep(2000);
+    return cur;
+}
+
+int main(void) {
+    srand((unsigned)time(NULL));
+
+    serial_open();
+
+    printf("=== 엘리베이터 SCAN 시뮬레이션 ===\n");
+    printf("Q 입력 시 종료\n");
+    printf("ETA: 8층 하강 호출 기준 예상 대기 시간\n");
+    printf("==================================\n");
+
+    int park = 1;
+    while (1) {
+        int result = run_once(park);
+        if (result == -1) { printf("\n[종료]\n"); break; }
+        park = result;
+    }
+
+    serial_close();
+    return 0;
+}
