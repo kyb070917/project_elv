@@ -12,9 +12,90 @@
 
 static HANDLE hSerial = INVALID_HANDLE_VALUE;
 
-// ===== 버튼 수신용 시리얼 읽기 버퍼 =====
 static char recvBuf[128];
 static int  recvIdx = 0;
+
+// ===== 상태 정의 =====
+#define STATE_MOVING  0
+#define STATE_DOOR    1
+#define STATE_IDLE    2
+
+#define MAX_FLOORS  9
+#define MAX_REQS    20  // 동적 추가 여유있게
+
+#define MOVE_TIME_REAL   1.5
+#define STOP_TIME_REAL   6.0
+#define MOVE_TIME_VISUAL 1500
+
+#define ETA_USER_FLOOR   8
+#define ETA_USER_DIR    -1
+
+typedef struct {
+    int call_floor;
+    int dest_floor;
+    int direction;
+    int picked_up;
+    int done;
+} Request;
+
+// ===== 전역 =====
+Request reqs[MAX_REQS];
+int total = 0;
+
+// ===== 함수 전방 선언 =====
+void serial_read_buttons(void);
+
+const char* dir_str(int dir) {
+    return (dir == 1) ? "상승" : "하강";
+}
+
+int has_remaining(Request* r, int count) {
+    for (int i = 0; i < count; i++)
+        if (!r[i].done) return 1;
+    return 0;
+}
+
+// ===== 중복 호출 체크 =====
+int is_duplicate_call(int floor) {
+    for (int i = 0; i < total; i++)
+        if (!reqs[i].done && reqs[i].call_floor == floor)
+            return 1;
+    return 0;
+}
+
+// ===== 랜덤 행선층 결정 =====
+// 1~5층 호출 → 6~9층 랜덤
+// 6~9층 호출 → 1~5층 랜덤
+int pick_dest(int call_floor) {
+    if (call_floor >= 1 && call_floor <= 5) {
+        return 6 + (rand() % 4); // 6~9
+    } else {
+        return 1 + (rand() % 5); // 1~5
+    }
+}
+
+// ===== 버튼으로 요청 추가 =====
+void add_button_request(int floor) {
+    if (total >= MAX_REQS) {
+        printf("*** 요청 초과 (무시) ***\n");
+        return;
+    }
+    if (is_duplicate_call(floor)) {
+        printf("*** %d층 이미 요청 중 (무시) ***\n", floor);
+        return;
+    }
+
+    int dest = pick_dest(floor);
+
+    reqs[total].call_floor = floor;
+    reqs[total].dest_floor = dest;
+    reqs[total].direction  = (dest > floor) ? 1 : -1;
+    reqs[total].picked_up  = 0;
+    reqs[total].done       = 0;
+    total++;
+
+    printf("*** %d층 버튼 눌림! → 행선 %d층 등록 ***\n", floor, dest);
+}
 
 int serial_open(void) {
     hSerial = CreateFileA(
@@ -36,20 +117,17 @@ int serial_open(void) {
     SetCommState(hSerial, &dcb);
 
     COMMTIMEOUTS to = { 0 };
-    to.ReadIntervalTimeout       = 10;   // 논블로킹 읽기용
+    to.ReadIntervalTimeout       = 10;
     to.ReadTotalTimeoutConstant  = 10;
     to.WriteTotalTimeoutConstant = 50;
     SetCommTimeouts(hSerial, &to);
 
     Sleep(3000);
-    // serial_open() 함수 위에 추가
-    void serial_read_buttons(void);
 
     char* hello = "HELLO\n";
     DWORD written;
     WriteFile(hSerial, hello, (DWORD)strlen(hello), &written, NULL);
 
-    // Sleep(6500); 대신
     for (int t = 0; t < 65; t++) {
         serial_read_buttons();
         Sleep(100);
@@ -59,7 +137,6 @@ int serial_open(void) {
     return 1;
 }
 
-// ===== 버튼 수신 처리 =====
 void serial_read_buttons(void) {
     if (hSerial == INVALID_HANDLE_VALUE) return;
 
@@ -75,9 +152,8 @@ void serial_read_buttons(void) {
             recvIdx = 0;
 
             int floor;
-            // BTN:N 형식 파싱
             if (sscanf(recvBuf, "BTN:%d", &floor) == 1) {
-                printf("\n*** %d층 버튼 눌림! ***\n", floor);
+                add_button_request(floor);
             }
         } else {
             if (recvIdx < (int)sizeof(recvBuf) - 1)
@@ -85,11 +161,6 @@ void serial_read_buttons(void) {
         }
     }
 }
-
-// ===== 상태 정의 =====
-#define STATE_MOVING  0
-#define STATE_DOOR    1
-#define STATE_IDLE    2
 
 void serial_send(int floor, int dir, double eta, int state) {
     if (hSerial == INVALID_HANDLE_VALUE) return;
@@ -107,35 +178,6 @@ void serial_close(void) {
         CloseHandle(hSerial);
         hSerial = INVALID_HANDLE_VALUE;
     }
-}
-// ─────────────────────────────────────────────
-
-#define MAX_FLOORS  9
-#define MAX_REQS     5
-
-#define MOVE_TIME_REAL   1.5
-#define STOP_TIME_REAL   6.0
-#define MOVE_TIME_VISUAL 1500
-
-#define ETA_USER_FLOOR   8
-#define ETA_USER_DIR    -1
-
-typedef struct {
-    int call_floor;
-    int dest_floor;
-    int direction;
-    int picked_up;
-    int done;
-} Request;
-
-const char* dir_str(int dir) {
-    return (dir == 1) ? "상승" : "하강";
-}
-
-int has_remaining(Request* reqs, int count) {
-    for (int i = 0; i < count; i++)
-        if (!reqs[i].done) return 1;
-    return 0;
 }
 
 int pick_unique_floor(int* used, int uf_count) {
@@ -160,12 +202,13 @@ Request make_random_req(int* used, int* uf_count) {
     r.done       = 0;
     return r;
 }
-
-int next_target(Request* reqs, int count, int cur, int dir) {
+//next_target: 현재 방향 기준으로 가장 가까운 다음 목표 층 반환 (없으면 -1) 
+//request 배열과 현재 층, 방향을 받아서 다음 목표 층을 결정하는 함수.
+int next_target(Request* r, int count, int cur, int dir) {
     int best = -1;
     for (int i = 0; i < count; i++) {
-        if (reqs[i].done) continue;
-        int t = reqs[i].picked_up ? reqs[i].dest_floor : reqs[i].call_floor;
+        if (r[i].done) continue;
+        int t = r[i].picked_up ? r[i].dest_floor : r[i].call_floor;
         if (dir == 1 && t > cur) {
             if (best == -1 || t < best) best = t;
         } else if (dir == -1 && t < cur) {
@@ -175,26 +218,26 @@ int next_target(Request* reqs, int count, int cur, int dir) {
     return best;
 }
 
-double predict_wait_time(Request* origin, int count, int cur, int dir) {
+double predict_wait_time(int cur, int dir) {
     Request sim[MAX_REQS + 1];
-    for (int i = 0; i < count; i++) sim[i] = origin[i];
+    for (int i = 0; i < total; i++) sim[i] = reqs[i];
 
-    int ui = count;
+    int ui = total;
     sim[ui].call_floor = ETA_USER_FLOOR;
     sim[ui].dest_floor = 1;
     sim[ui].direction  = ETA_USER_DIR;
     sim[ui].picked_up  = 0;
     sim[ui].done       = 0;
-    int total = count + 1;
+    int sim_total = total + 1;
 
     double elapsed = 0.0;
     int safety = 0;
 
-    while (safety++ < 500) {
-        int target = next_target(sim, total, cur, dir);
+    while (safety++ < 1000) {
+        int target = next_target(sim, sim_total, cur, dir);
         if (target == -1) {
             dir = -dir;
-            target = next_target(sim, total, cur, dir);
+            target = next_target(sim, sim_total, cur, dir);
             if (target == -1) break;
         }
 
@@ -203,13 +246,13 @@ double predict_wait_time(Request* origin, int count, int cur, int dir) {
             elapsed += MOVE_TIME_REAL;
             int acted = 0;
 
-            for (int i = 0; i < total; i++) {
+            for (int i = 0; i < sim_total; i++) {
                 if (!sim[i].done && sim[i].picked_up && sim[i].dest_floor == cur) {
                     sim[i].done = 1;
                     acted = 1;
                 }
             }
-            for (int i = 0; i < total; i++) {
+            for (int i = 0; i < sim_total; i++) {
                 if (!sim[i].done && !sim[i].picked_up &&
                     sim[i].call_floor == cur && sim[i].direction == dir) {
                     if (i == ui) return elapsed;
@@ -220,7 +263,7 @@ double predict_wait_time(Request* origin, int count, int cur, int dir) {
             if (acted) elapsed += STOP_TIME_REAL;
 
             if (cur != target) {
-                int new_t = next_target(sim, total, cur, dir);
+                int new_t = next_target(sim, sim_total, cur, dir);
                 if (new_t != -1 && ((dir == 1 && new_t < target) || (dir == -1 && new_t > target)))
                     target = new_t;
             }
@@ -229,16 +272,16 @@ double predict_wait_time(Request* origin, int count, int cur, int dir) {
     return -1.0;
 }
 
-int process_floor(Request* reqs, int count, int cur, int dir) {
+int process_floor(int cur, int dir) {
     int processed = 0;
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < total; i++) {
         if (!reqs[i].done && reqs[i].picked_up && reqs[i].dest_floor == cur) {
             reqs[i].done = 1;
             printf("  >> person%d 하차\n", i);
             processed++;
         }
     }
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < total; i++) {
         if (!reqs[i].done && !reqs[i].picked_up &&
             reqs[i].call_floor == cur && reqs[i].direction == dir) {
             reqs[i].picked_up = 1;
@@ -249,8 +292,8 @@ int process_floor(Request* reqs, int count, int cur, int dir) {
     return processed;
 }
 
-void pickup_opposite(Request* reqs, int count, int cur, int dir) {
-    for (int i = 0; i < count; i++) {
+void pickup_opposite(int cur, int dir) {
+    for (int i = 0; i < total; i++) {
         if (!reqs[i].done && !reqs[i].picked_up &&
             reqs[i].call_floor == cur && reqs[i].direction == dir) {
             reqs[i].picked_up = 1;
@@ -263,10 +306,7 @@ void do_stop(int cur, int dir) {
     serial_send(cur, dir, 0.0, STATE_DOOR);
     for (int t = 0; t < (int)(STOP_TIME_REAL * 10); t++) {
         serial_send(cur, dir, 0.0, STATE_DOOR);
-
-        // 문 열린 동안도 버튼 수신 처리
         serial_read_buttons();
-
         Sleep(100);
     }
 }
@@ -274,14 +314,14 @@ void do_stop(int cur, int dir) {
 int run_once(int park_floor) {
     int cur = park_floor;
     int dir = 1;
-    int total = 3;
 
-    Request reqs[MAX_REQS];
+    // ===== 전역 reqs 초기화 =====
     int used[MAX_FLOORS * 2];
     int uf = 0;
+    total = 0;
 
     for (int i = 0; i < 3; i++)
-        reqs[i] = make_random_req(used, &uf);
+        reqs[total++] = make_random_req(used, &uf);
 
     int up = 0, dn = 0;
     for (int i = 0; i < total; i++) {
@@ -298,19 +338,16 @@ int run_once(int park_floor) {
             i, reqs[i].call_floor, dir_str(reqs[i].direction), reqs[i].dest_floor);
     printf("\n");
 
-    int moves = 0, stops = 0;
-
     while (has_remaining(reqs, total)) {
         if (_kbhit() && (_getch() & 0xDF) == 'Q') return -1;
 
-        // 버튼 수신
         serial_read_buttons();
 
         int target = next_target(reqs, total, cur, dir);
         if (target == -1) {
             dir = -dir;
             printf("[방향 전환] %s 방향\n\n", dir_str(dir));
-            pickup_opposite(reqs, total, cur, dir);
+            pickup_opposite(cur, dir);
             target = next_target(reqs, total, cur, dir);
         }
         if (target == -1) break;
@@ -318,13 +355,11 @@ int run_once(int park_floor) {
         while (cur != target) {
             if (_kbhit() && (_getch() & 0xDF) == 'Q') return -1;
 
-            // 버튼 수신
             serial_read_buttons();
 
             cur += dir;
-            moves++;
 
-            double wait = predict_wait_time(reqs, total, cur, dir);
+            double wait = predict_wait_time(cur, dir);
 
             if (wait >= 0)
                 printf("  %s 중: %2d층   [8층↓ ETA %5.1f초]\n", dir_str(dir), cur, wait);
@@ -332,8 +367,8 @@ int run_once(int park_floor) {
                 printf("  %s 중: %2d층   [8층↓ ETA  ---  ]\n", dir_str(dir), cur);
 
             serial_send(cur, dir, wait, STATE_MOVING);
-            for (int t = 0; t < (MOVE_TIME_VISUAL / 100); t++) 
-            {
+
+            for (int t = 0; t < (MOVE_TIME_VISUAL / 100); t++) {
                 serial_read_buttons();
                 Sleep(100);
             }
@@ -355,7 +390,6 @@ int run_once(int park_floor) {
                 }
             }
             if (mid_acted) {
-                stops++;
                 do_stop(cur, dir);
                 int new_t = next_target(reqs, total, cur, dir);
                 if (new_t == -1) break;
@@ -366,8 +400,7 @@ int run_once(int park_floor) {
         if (!has_remaining(reqs, total)) break;
 
         printf("\n[%d층 정차]\n", cur);
-        stops++;
-        process_floor(reqs, total, cur, dir);
+        process_floor(cur, dir);
         printf("\n");
 
         do_stop(cur, dir);
