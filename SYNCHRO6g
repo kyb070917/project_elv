@@ -1,0 +1,876 @@
+#define _CRT_SECURE_NO_WARNINGS
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <conio.h>
+#include <windows.h>
+#include <string.h>
+
+// ── 시리얼 포트 ──────────────────────────────
+#define SERIAL_PORT "COM4"
+#define SERIAL_BAUD  CBR_9600
+
+static HANDLE hSerial = INVALID_HANDLE_VALUE;
+
+static char recvBuf[128];
+static int recvIdx = 0;
+
+// ===== 상태 정의 =====
+#define STATE_MOVING  0
+#define STATE_DOOR    1
+#define STATE_IDLE    2 
+
+#define MAX_FLOORS  9
+#define MAX_REQS    20
+
+#define MOVE_TIME_REAL   1.5
+#define STOP_TIME_REAL   6.0
+#define MOVE_TIME_VISUAL 1500
+
+// ===== ETA 승객 =====
+#define ETA_USER_FLOOR 8
+#define ETA_USER_DEST  1
+#define ETA_USER_DIR  -1
+
+typedef struct {
+    int call_floor;
+    int dest_floor;
+    int direction;
+    int picked_up;
+    int done;
+} Request;
+
+// ===== 전역 =====
+Request reqs[MAX_REQS];
+
+int total = 0;
+
+int eta_index = -1;
+
+// ===== 함수 선언 =====
+void serial_read_buttons(void);
+
+const char* dir_str(int dir) {
+    return (dir == 1) ? "상승" : "하강";
+}
+
+int has_remaining(Request* r, int count) {
+
+    for (int i = 0; i < count; i++) {
+        if (!r[i].done)
+            return 1;
+    }
+
+    return 0;
+}
+
+int is_duplicate_call(int floor) {
+
+    for (int i = 0; i < total; i++) {
+
+        if (!reqs[i].done &&
+            reqs[i].call_floor == floor) {
+
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+int pick_dest(int call_floor) {
+
+    if (call_floor >= 1 && call_floor <= 5)
+        return 6 + (rand() % 4);
+
+    return 1 + (rand() % 5);
+}
+
+void add_button_request(int floor) {
+
+    if (total >= MAX_REQS) {
+        printf("요청 초과\n");
+        return;
+    }
+
+    if (is_duplicate_call(floor)) {
+        printf("%d층 이미 요청 중\n", floor);
+        return;
+    }
+
+    int dest = pick_dest(floor);
+
+    reqs[total].call_floor = floor;
+    reqs[total].dest_floor = dest;
+    reqs[total].direction = (dest > floor) ? 1 : -1;
+    reqs[total].picked_up = 0;
+    reqs[total].done = 0;
+
+    total++;
+
+    printf("*** %d층 버튼 눌림 → %d층 등록 ***\n",
+        floor,
+        dest);
+}
+
+int serial_open(void) {
+
+    hSerial = CreateFileA(
+        SERIAL_PORT,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+
+    if (hSerial == INVALID_HANDLE_VALUE) {
+
+        fprintf(stderr,
+            "[WARN] 시리얼 포트 열기 실패: %s\n",
+            SERIAL_PORT);
+
+        return 0;
+    }
+
+    DCB dcb = { 0 };
+
+    dcb.DCBlength = sizeof(dcb);
+
+    GetCommState(hSerial, &dcb);
+
+    dcb.BaudRate = SERIAL_BAUD;
+    dcb.ByteSize = 8;
+    dcb.StopBits = ONESTOPBIT;
+    dcb.Parity = NOPARITY;
+
+    SetCommState(hSerial, &dcb);
+
+    COMMTIMEOUTS to = { 0 };
+
+    to.ReadIntervalTimeout = 10;
+    to.ReadTotalTimeoutConstant = 10;
+    to.WriteTotalTimeoutConstant = 50;
+
+    SetCommTimeouts(hSerial, &to);
+
+    Sleep(3000);
+
+    PurgeComm(hSerial,
+        PURGE_RXCLEAR |
+        PURGE_TXCLEAR);
+
+    printf("[INFO] 시리얼 포트 연결: %s\n",
+        SERIAL_PORT);
+
+    return 1;
+}
+
+void serial_read_buttons(void) {
+
+    if (hSerial == INVALID_HANDLE_VALUE)
+        return;
+
+    char c;
+    DWORD read;
+
+    while (1) {
+
+        ReadFile(hSerial,
+            &c,
+            1,
+            &read,
+            NULL);
+
+        if (read == 0)
+            break;
+
+        if (c == '\n') {
+
+            recvBuf[recvIdx] = '\0';
+
+            recvIdx = 0;
+
+            int floor;
+
+            if (sscanf(recvBuf,
+                "BTN:%d",
+                &floor) == 1) {
+
+                add_button_request(floor);
+            }
+        }
+        else {
+
+            if (recvIdx < sizeof(recvBuf) - 1)
+                recvBuf[recvIdx++] = c;
+        }
+    }
+}
+
+void serial_send(int floor,
+    int dir,
+    double eta,
+    int state) {
+
+    if (hSerial == INVALID_HANDLE_VALUE)
+        return;
+
+    char buf[64];
+
+    int eta10 =
+        (eta >= 0)
+        ? (int)(eta * 10 + 0.5)
+        : -1;
+
+    sprintf(buf,
+        "F:%d,D:%d,E:%d,S:%d\n",
+        floor,
+        dir,
+        eta10,
+        state);
+
+    DWORD written;
+
+    WriteFile(hSerial,
+        buf,
+        (DWORD)strlen(buf),
+        &written,
+        NULL);
+}
+
+void serial_close(void) {
+
+    if (hSerial != INVALID_HANDLE_VALUE) {
+
+        CloseHandle(hSerial);
+
+        hSerial = INVALID_HANDLE_VALUE;
+    }
+}
+
+int pick_unique_floor(int* used,
+    int uf_count) {
+
+    int f;
+
+    while (1) {
+
+        f = (rand() % MAX_FLOORS) + 1;
+
+        int dup = 0;
+
+        for (int i = 0; i < uf_count; i++) {
+
+            if (used[i] == f) {
+                dup = 1;
+                break;
+            }
+        }
+
+        if (!dup)
+            return f;
+    }
+}
+
+Request make_random_req(int* used,
+    int* uf_count) {
+
+    Request r;
+
+    r.call_floor =
+        pick_unique_floor(used, *uf_count);
+
+    used[(*uf_count)++] = r.call_floor;
+
+    r.dest_floor =
+        pick_unique_floor(used, *uf_count);
+
+    used[(*uf_count)++] = r.dest_floor;
+
+    r.direction =
+        (r.dest_floor > r.call_floor)
+        ? 1 : -1;
+
+    r.picked_up = 0;
+    r.done = 0;
+
+    return r;
+}
+
+// ===== LOOK =====
+int next_target(Request* r,
+    int count,
+    int cur,
+    int dir) {
+
+    int best = -1;
+
+    // 현재 방향 탐색
+    for (int i = 0; i < count; i++) {
+
+        if (r[i].done)
+            continue;
+
+        int t;
+
+        if (r[i].picked_up)
+            t = r[i].dest_floor;
+        else {
+
+            if (r[i].direction != dir)
+                continue;
+
+            t = r[i].call_floor;
+        }
+
+        if (dir == 1 && t > cur) {
+
+            if (best == -1 || t < best)
+                best = t;
+        }
+        else if (dir == -1 && t < cur) {
+
+            if (best == -1 || t > best)
+                best = t;
+        }
+    }
+
+    // 현재 방향 없으면
+    // 반대 방향 가장 가까운 요청 찾기
+    if (best == -1) {
+
+        for (int i = 0; i < count; i++) {
+
+            if (r[i].done)
+                continue;
+
+            int t;
+
+            if (r[i].picked_up)
+                t = r[i].dest_floor;
+            else
+                t = r[i].call_floor;
+
+            if (dir == 1) {
+
+                // 상승 끝 → 가장 위 요청
+                if (t > cur) {
+
+                    if (best == -1 || t < best)
+                        best = t;
+                }
+            }
+            else {
+
+                // 하강 끝 → 가장 아래 요청
+                if (t < cur) {
+
+                    if (best == -1 || t > best)
+                        best = t;
+                }
+            }
+        }
+    }
+
+    return best;
+}
+
+
+// ===== ETA 계산 =====
+double calc_eta(int cur_floor, int cur_dir) {
+
+    // 이미 탑승했거나 완료된 경우
+    if (reqs[eta_index].picked_up ||
+        reqs[eta_index].done)
+        return -1.0;
+
+    Request sim[MAX_REQS];
+
+    memcpy(sim,
+           reqs,
+           total * sizeof(Request));
+
+    int sc = cur_floor;
+    int sd = cur_dir;
+
+    double t = 0.0;
+
+    // 현재 층 즉시 탑승 처리
+    for (int i = 0; i < total; i++) {
+
+        if (!sim[i].done &&
+            !sim[i].picked_up &&
+             sim[i].call_floor == sc &&
+             sim[i].direction  == sd) {
+
+            sim[i].picked_up = 1;
+
+            if (i == eta_index)
+                return STOP_TIME_REAL;
+        }
+    }
+
+    for (int guard = 0;
+         guard < 10000 &&
+         has_remaining(sim, total);
+         guard++) {
+
+        int tgt =
+            next_target(sim,
+                        total,
+                        sc,
+                        sd);
+
+        // ===== 방향 전환 =====
+        if (tgt == -1) {
+
+            sd = -sd;
+
+            int acted = 0;
+
+            // 방향 바꾸자마자 현재 층 처리
+            for (int i = 0; i < total; i++) {
+
+                if (!sim[i].done &&
+                    !sim[i].picked_up &&
+                     sim[i].call_floor == sc &&
+                     sim[i].direction  == sd) {
+
+                    sim[i].picked_up = 1;
+
+                    acted = 1;
+
+                    // ETA_USER 탑승
+                    if (i == eta_index)
+                        return t + STOP_TIME_REAL;
+                }
+            }
+
+            // 문 열림 시간 반영
+            if (acted)
+                t += STOP_TIME_REAL;
+
+            tgt =
+                next_target(sim,
+                            total,
+                            sc,
+                            sd);
+
+            // 그래도 없으면 종료
+            if (tgt == -1)
+                break;
+        }
+
+        // ===== 이동 =====
+        while (sc != tgt) {
+
+            sc += sd;
+
+            t += MOVE_TIME_REAL;
+
+            // ETA_USER 도착
+            if (!sim[eta_index].done &&
+                !sim[eta_index].picked_up &&
+                 sim[eta_index].call_floor == sc &&
+                 sim[eta_index].direction  == sd) {
+
+                return t + STOP_TIME_REAL;
+            }
+
+            int acted = 0;
+
+            // ===== 하차 =====
+            for (int i = 0; i < total; i++) {
+
+                if (!sim[i].done &&
+                     sim[i].picked_up &&
+                     sim[i].dest_floor == sc) {
+
+                    sim[i].done = 1;
+
+                    acted = 1;
+                }
+            }
+
+            // ===== 탑승 =====
+            for (int i = 0; i < total; i++) {
+
+                if (!sim[i].done &&
+                    !sim[i].picked_up &&
+                     sim[i].call_floor == sc &&
+                     sim[i].direction  == sd) {
+
+                    sim[i].picked_up = 1;
+
+                    acted = 1;
+
+                    // ETA_USER 탑승
+                    if (i == eta_index)
+                        return t + STOP_TIME_REAL;
+                }
+            }
+
+            // ===== 정차 =====
+            if (acted) {
+
+                t += STOP_TIME_REAL;
+
+                int nt =
+                    next_target(sim,
+                                total,
+                                sc,
+                                sd);
+
+                // 방향 끝
+                if (nt == -1)
+                    break;
+
+                tgt = nt;
+            }
+        }
+    }
+
+    return -1.0;
+}
+
+
+int process_floor(int cur,
+    int dir) {
+
+    int processed = 0;
+
+    // 하차
+    for (int i = 0; i < total; i++) {
+
+        if (!reqs[i].done &&
+            reqs[i].picked_up &&
+            reqs[i].dest_floor == cur) {
+
+            reqs[i].done = 1;
+
+            if (i == eta_index)
+                printf("  >> ETA_USER 하차\n");
+            else
+                printf("  >> person%d 하차\n", i);
+
+            processed++;
+        }
+    }
+
+    // 탑승
+    for (int i = 0; i < total; i++) {
+
+        if (!reqs[i].done &&
+            !reqs[i].picked_up &&
+            reqs[i].call_floor == cur &&
+            reqs[i].direction == dir) {
+
+            reqs[i].picked_up = 1;
+
+            if (i == eta_index)
+                printf("  >> ETA_USER 탑승\n");
+            else {
+                printf("  >> person%d 탑승 (행선 %d층)\n",
+                    i,
+                    reqs[i].dest_floor);
+            }
+
+            processed++;
+        }
+    }
+
+    return processed;
+}
+
+void pickup_opposite(int cur,
+    int dir) {
+
+    for (int i = 0; i < total; i++) {
+
+        if (!reqs[i].done &&
+            !reqs[i].picked_up &&
+            reqs[i].call_floor == cur &&
+            reqs[i].direction == dir) {
+
+            reqs[i].picked_up = 1;
+
+            if (i == eta_index)
+                printf("  >> ETA_USER 탑승\n");
+            else {
+                printf("  >> person%d 탑승 (행선 %d층)\n",
+                    i,
+                    reqs[i].dest_floor);
+            }
+        }
+    }
+}
+
+void do_stop(int cur,
+    int dir) {
+
+    serial_send(cur,
+        dir,
+        0.0,
+        STATE_DOOR);
+
+    for (int t = 0;
+        t < (int)(STOP_TIME_REAL * 10);
+        t++) {
+
+        serial_send(cur,
+            dir,
+            0.0,
+            STATE_DOOR);
+
+        serial_read_buttons();
+
+        Sleep(100); 
+    }
+}
+
+int run_once(int park_floor) {
+
+    int cur = park_floor;
+    int dir = 1;
+
+    int used[MAX_FLOORS * 2];
+    int uf = 0;
+
+    total = 0;
+
+    // 랜덤 요청
+    for (int i = 0; i < 2; i++)
+        reqs[total++] =
+        make_random_req(used, &uf);
+
+    // ETA 승객 추가
+    reqs[total].call_floor =
+        ETA_USER_FLOOR;
+
+    reqs[total].dest_floor =
+        ETA_USER_DEST;
+
+    reqs[total].direction =
+        ETA_USER_DIR;
+
+    reqs[total].picked_up = 0;
+    reqs[total].done = 0;
+
+    eta_index = total;
+
+    total++;
+
+    int up = 0;
+    int dn = 0;
+
+    for (int i = 0; i < total; i++) {
+
+        if (reqs[i].call_floor > cur)
+            up++;
+        else if (reqs[i].call_floor < cur)
+            dn++;
+    }
+
+    dir = (up >= dn)
+        ? 1
+        : -1;
+
+    printf("[%d층 출발 전 탑승 처리]\n",
+        cur);
+
+    process_floor(cur, dir);
+
+    printf("\n[운행 시작]\n");
+
+    printf("현재 층: %d층 | 초기 방향: %s\n\n",
+        cur,
+        dir_str(dir));
+
+    printf("[초기 호출]\n");
+
+    for (int i = 0; i < total; i++) {
+
+        if (i == eta_index) {
+
+            printf("  ETA_USER : %d층 호출 / %s / 행선 %d층\n",
+                reqs[i].call_floor,
+                dir_str(reqs[i].direction),
+                reqs[i].dest_floor);
+        }
+        else {
+
+            printf("  person%d : %d층 호출 / %s / 행선 %d층\n",
+                i,
+                reqs[i].call_floor,
+                dir_str(reqs[i].direction),
+                reqs[i].dest_floor);
+        }
+    }
+
+    printf("\n");
+
+    while (has_remaining(reqs, total)) {
+
+        if (_kbhit() &&
+            (_getch() & 0xDF) == 'Q')
+            return -1;
+
+        serial_read_buttons();
+
+        int target =
+            next_target(reqs,
+                total,
+                cur,
+                dir);
+
+        if (target == -1) {
+
+            dir = -dir;
+
+            printf("[방향 전환] %s 방향\n\n",
+                dir_str(dir));
+
+            pickup_opposite(cur, dir);
+
+            target =
+                next_target(reqs,
+                    total,
+                    cur,
+                    dir);
+        }
+
+        if (target == -1)
+            break;
+
+        while (cur != target) {
+
+            if (_kbhit() &&
+                (_getch() & 0xDF) == 'Q')
+                return -1;
+
+            serial_read_buttons();
+
+            int new_t =
+                next_target(reqs,
+                    total,
+                    cur,
+                    dir);
+
+            if (new_t != -1 &&
+                ((dir == 1 && new_t < target) ||
+                 (dir == -1 && new_t > target))) {
+
+                target = new_t;
+            }
+
+            cur += dir;
+            double eta_now = calc_eta(cur, dir);
+
+            if (!reqs[eta_index].picked_up) {
+
+                printf("  %s 중: %2d층   [8층↓ ETA %5.1f초]\n",
+                    dir_str(dir),
+                    cur,
+                    eta_now);
+
+                serial_send(cur, dir, eta_now, STATE_MOVING);
+            }
+            else {
+
+                printf("  %s 중: %2d층\n",
+                    dir_str(dir),
+                    cur);
+
+                serial_send(cur, dir, -1.0, STATE_MOVING);
+            } // cur += dir 아래로 여기까지 업뎃. 싱크로 6에서는 ETA 계산이 실시간으로 이뤄지도록 변경. 이동 중에도 ETA 계산해서 시리얼로 보내야한다.
+
+
+            for (int t = 0;
+                t < (MOVE_TIME_VISUAL / 100);
+                t++) {
+
+                serial_read_buttons();
+
+                Sleep(100);
+            }
+
+            int mid_acted =
+                process_floor(cur, dir);
+
+            if (mid_acted) {
+                do_stop(cur, dir);
+
+                int new_t =
+                    next_target(reqs,
+                        total,
+                        cur,
+                        dir);
+
+                if (new_t == -1)
+                    break;
+
+                target = new_t;
+            }
+        }
+
+        if (!has_remaining(reqs, total))
+            break;
+
+        printf("\n[%d층 정차]\n",
+            cur);
+
+        process_floor(cur, dir);
+
+        printf("\n");
+
+        do_stop(cur, dir);
+    }
+
+    printf("[IDLE] 모든 요청 완료\n");
+
+    printf("----------------------------------------\n");
+
+    serial_send(cur,
+        0,
+        -1.0,
+        STATE_IDLE);
+
+    Sleep(2000);
+
+    return cur;
+}
+
+int main(void) {
+
+    srand((unsigned)time(NULL));
+
+    serial_open();
+
+    printf("=== 엘리베이터 LOOK 시뮬레이션 ===\n");
+    printf("Q 입력 시 종료\n");
+    printf("==================================\n");
+
+    int park = 1;
+
+    while (1) {
+
+        int result =
+            run_once(park);
+
+        if (result == -1) {
+
+            printf("\n[종료]\n");
+
+            break;
+        }
+
+        park = result;
+    }
+
+    serial_close();
+
+    return 0;
+}
