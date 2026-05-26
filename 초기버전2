@@ -1,0 +1,334 @@
+#define _CRT_SECURE_NO_WARNINGS
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <conio.h>
+#include <windows.h>
+
+#define MAX_FLOORS  15
+#define MAX_REQS     5
+
+#define MOVE_TIME_REAL   0.7
+#define STOP_TIME_REAL   2.0
+
+#define MOVE_TIME_VISUAL 700
+
+#define ETA_USER_FLOOR   8
+#define ETA_USER_DIR    -1
+
+typedef struct {
+    int call_floor;
+    int dest_floor;
+    int direction;
+    int picked_up;
+    int done;
+} Request;
+
+const char* dir_str(int dir) {
+    return (dir == 1) ? "상승" : "하강";
+}
+
+int has_remaining(Request* reqs, int count) {
+    for (int i = 0; i < count; i++)
+        if (!reqs[i].done) return 1; //남은 층이 있을 시 1리턴
+    return 0;
+}
+
+int pick_unique_floor(int* used, int uf_count) {
+    int f;
+    while (1) {
+        f = (rand() % MAX_FLOORS) + 1;
+        int dup = 0;
+        for (int i = 0; i < uf_count; i++)
+            if (used[i] == f) { dup = 1; break; }
+        if (!dup) return f;
+    }
+}
+
+Request make_random_req(int* used, int* uf_count) {
+    Request r;
+    r.call_floor = pick_unique_floor(used, *uf_count);
+    used[(*uf_count)++] = r.call_floor;
+    r.dest_floor = pick_unique_floor(used, *uf_count);
+    used[(*uf_count)++] = r.dest_floor;
+    r.direction = (r.dest_floor > r.call_floor) ? 1 : -1;
+    r.picked_up = 0;
+    r.done = 0;
+    return r;
+}
+
+// --------------------------------------------------
+// 현재 방향 기준 다음 목표
+// --------------------------------------------------
+int next_target(Request* reqs, int count, int cur, int dir) {
+    int best = -1;
+    for (int i = 0; i < count; i++) {
+        if (reqs[i].done) continue;
+        int t = reqs[i].picked_up ? reqs[i].dest_floor : reqs[i].call_floor;
+        if (dir == 1 && t > cur) {
+            if (best == -1 || t < best) best = t;
+        } else if (dir == -1 && t < cur) {
+            if (best == -1 || t > best) best = t;
+        }
+    }
+    return best;
+}
+
+// --------------------------------------------------
+// ETA 계산 (8층 하강 호출 기준)
+// 엘리베이터가 8층에 도착하여 하강 탑승 가능한 시점까지의 시간
+// --------------------------------------------------
+double predict_wait_time(
+    Request* origin, int count,
+    int cur, int dir
+) {
+    Request sim[MAX_REQS + 1];
+    for (int i = 0; i < count; i++)
+        sim[i] = origin[i];
+
+    // 사용자 요청 추가 (마지막 인덱스)
+    int ui = count;
+    sim[ui].call_floor = ETA_USER_FLOOR;
+    sim[ui].dest_floor = 1;
+    sim[ui].direction  = ETA_USER_DIR;
+    sim[ui].picked_up  = 0;
+    sim[ui].done       = 0;
+    int total = count + 1;
+
+    double elapsed = 0.0;
+    int safety = 0;
+
+    while (safety++ < 500) {
+
+        int target = next_target(sim, total, cur, dir);
+
+        if (target == -1) {
+            dir = -dir;
+            target = next_target(sim, total, cur, dir);
+            if (target == -1) break;
+        }
+
+        // 한 층씩 이동
+        while (cur != target) {
+            cur += dir;
+            elapsed += MOVE_TIME_REAL;
+
+            // 이 층에서 처리할 일이 있는지 검사
+            int acted = 0;
+
+            // 하차
+            for (int i = 0; i < total; i++) {
+                if (!sim[i].done && sim[i].picked_up && sim[i].dest_floor == cur) {
+                    sim[i].done = 1;
+                    acted = 1;
+                }
+            }
+
+            // 탑승 (같은 방향)
+            for (int i = 0; i < total; i++) {
+                if (!sim[i].done && !sim[i].picked_up &&
+                    sim[i].call_floor == cur && sim[i].direction == dir) {
+
+                    if (i == ui) return elapsed; // 사용자 탑승 = 도착
+
+                    sim[i].picked_up = 1;
+                    acted = 1;
+                }
+            }
+
+            // 정차 시간: 이 층에서 뭔가 처리했으면 1회만 가산
+            if (acted)
+                elapsed += STOP_TIME_REAL;
+
+            // target이 완료되었을 수 있으므로 재탐색
+            if (cur != target) {
+                int new_t = next_target(sim, total, cur, dir);
+                if (new_t != -1 && ((dir == 1 && new_t < target) || (dir == -1 && new_t > target)))
+                    target = new_t;
+            }
+        }
+
+        // target 도착 — 이미 위 루프에서 처리 완료
+    }
+
+    return -1.0;
+}
+
+// --------------------------------------------------
+// 층 처리 (하차 + 탑승)
+// --------------------------------------------------
+int process_floor(Request* reqs, int count, int cur, int dir) {
+    int processed = 0;
+
+    for (int i = 0; i < count; i++) {
+        if (!reqs[i].done && reqs[i].picked_up && reqs[i].dest_floor == cur) {
+            reqs[i].done = 1;
+            printf("  >> person%d 하차\n", i);
+            processed++;
+        }
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (!reqs[i].done && !reqs[i].picked_up &&
+            reqs[i].call_floor == cur && reqs[i].direction == dir) {
+            reqs[i].picked_up = 1;
+            printf("  >> person%d 탑승 (행선 층: %d층)\n", i, reqs[i].dest_floor);
+            processed++;
+        }
+    }
+
+    return processed;
+}
+
+// --------------------------------------------------
+// 반대 방향 탑승
+// --------------------------------------------------
+void pickup_opposite(Request* reqs, int count, int cur, int dir) {
+    for (int i = 0; i < count; i++) {
+        if (!reqs[i].done && !reqs[i].picked_up &&
+            reqs[i].call_floor == cur && reqs[i].direction == dir) {
+            reqs[i].picked_up = 1;
+            printf("  >> person%d 탑승 (행선 층: %d층)\n", i, reqs[i].dest_floor);
+        }
+    }
+}
+
+// --------------------------------------------------
+// 운행 1회
+// --------------------------------------------------
+int run_once(int park_floor) {
+    int cur = park_floor;
+    int dir = 1;
+    int total = 3;
+    int extra = 0;
+
+    Request reqs[MAX_REQS];
+    int used[MAX_FLOORS * 2];
+    int uf = 0;
+
+    for (int i = 0; i < 3; i++)
+        reqs[i] = make_random_req(used, &uf);
+
+    int up = 0, dn = 0;
+    for (int i = 0; i < total; i++) {
+        if (reqs[i].call_floor > cur) up++;
+        else if (reqs[i].call_floor < cur) dn++;
+    }
+    dir = (up >= dn) ? 1 : -1;
+
+    printf("\n[운행 시작]\n");
+    printf("현재 층: %d층 | 초기 방향: %s\n\n", cur, dir_str(dir));
+
+    printf("[초기 호출]\n");
+    for (int i = 0; i < total; i++)
+        printf("  person%d : %d층 호출 / %s / 행선 %d층\n",
+            i, reqs[i].call_floor, dir_str(reqs[i].direction), reqs[i].dest_floor);
+    printf("\n");
+
+    int cooldown = 4 + (rand() % 3);
+    int moves = 0, stops = 0;
+
+    while (has_remaining(reqs, total)) {
+
+        if (_kbhit() && (_getch() & 0xDF) == 'Q') return -1;
+
+        int target = next_target(reqs, total, cur, dir);
+
+        if (target == -1) {
+            dir = -dir;
+            printf("[방향 전환] %s 방향\n\n", dir_str(dir));
+            pickup_opposite(reqs, total, cur, dir);
+            target = next_target(reqs, total, cur, dir);
+        }
+        if (target == -1) break;
+
+        while (cur != target) {
+            if (_kbhit() && (_getch() & 0xDF) == 'Q') return -1;
+
+            cur += dir;
+            moves++;
+
+            double wait = predict_wait_time(reqs, total, cur, dir);
+
+            if (wait >= 0)
+                printf("  %s 중: %2d층   [8층↓ ETA %5.1f초]\n", dir_str(dir), cur, wait);
+            else
+                printf("  %s 중: %2d층   [8층↓ ETA  ---  ]\n", dir_str(dir), cur);
+
+            Sleep(MOVE_TIME_VISUAL);
+
+            // 중간 층 처리 (target 아닌 층에서도 탑승/하차)
+            int mid_acted = 0;
+            for (int i = 0; i < total; i++) {
+                if (!reqs[i].done && reqs[i].picked_up && reqs[i].dest_floor == cur) {
+                    reqs[i].done = 1;
+                    printf("  >> person%d 하차\n", i);
+                    mid_acted = 1;
+                }
+            }
+            for (int i = 0; i < total; i++) {
+                if (!reqs[i].done && !reqs[i].picked_up &&
+                    reqs[i].call_floor == cur && reqs[i].direction == dir) {
+                    reqs[i].picked_up = 1;
+                    printf("  >> person%d 탑승 (행선 층: %d층)\n", i, reqs[i].dest_floor);
+                    mid_acted = 1;
+                }
+            }
+            if (mid_acted) {
+                stops++;
+                Sleep(1000);
+                // target 재계산
+                int new_t = next_target(reqs, total, cur, dir);
+                if (new_t == -1) break;
+                target = new_t;
+            }
+
+            // 추가 호출
+            /*
+            if (!extra && stops >= 1 && moves >= cooldown && total < MAX_REQS && uf + 2 <= MAX_FLOORS * 2) {
+                extra = 1;
+                reqs[total] = make_random_req(used, &uf);
+                printf("\n  ★ 추가 호출 발생\n");
+                printf("    person%d : %d층 호출 / %s / 행선 %d층\n\n",
+                    total, reqs[total].call_floor, dir_str(reqs[total].direction), reqs[total].dest_floor);
+                total++;
+                // target 재계산
+                int new_t = next_target(reqs, total, cur, dir);
+                if (new_t != -1) target = new_t;
+            }
+            */
+            
+        }
+
+        if (!has_remaining(reqs, total)) break; 
+
+        printf("\n[%d층 정차]\n", cur);
+        stops++;
+        process_floor(reqs, total, cur, dir);
+        printf("\n");
+        Sleep(1000);
+    }
+
+    printf("[IDLE] 모든 요청 완료\n");
+    printf("----------------------------------------\n");
+    Sleep(2000);
+    return cur;
+}
+
+// --------------------------------------------------
+int main(void) {
+    srand((unsigned)time(NULL));
+    printf("=== 엘리베이터 SCAN 시뮬레이션 ===\n");
+    printf("Q 입력 시 종료\n");
+    printf("ETA: 8층 하강 호출 기준 예상 대기 시간\n");
+    printf("==================================\n");
+
+    int park = 1;
+    while (1) {
+        int result = run_once(park);
+        if (result == -1) { printf("\n[종료]\n"); break; }
+        park = result;
+    }
+    return 0;
+}
