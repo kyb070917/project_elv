@@ -1,0 +1,174 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+// 호출 한 건의 데이터
+typedef struct {
+    int call_floor;   // 호출 층
+    int dest_floor;   // 행선 층
+    int direction;    // 1: 상승, -1: 하강
+    int picked_up;    // 0: 아직 탑승 전, 1: 탑승 완료
+    int done;         // 0: 미완료, 1: 완료
+} Request;
+
+// 방향 문자열 반환
+const char* dir_str(int dir) {
+    return (dir == 1) ? "상승" : "하강";
+}
+
+// 남은 요청 존재 여부
+int has_remaining(Request* reqs, int count) {
+    for (int i = 0; i < count; i++)
+        if (!reqs[i].done) return 1;
+    return 0;
+}
+
+// 현재 방향 기준으로 다음 목표 층 결정 (SCAN)
+// 탑승 전 → call_floor 로, 탑승 후 → dest_floor 로
+int next_target(Request* reqs, int count, int cur, int dir) {
+    int best = -1;
+
+    // 현재 방향으로 갈 수 있는 가장 가까운 목표
+    for (int i = 0; i < count; i++) {
+        if (reqs[i].done) continue;
+
+        int target = reqs[i].picked_up ? reqs[i].dest_floor : reqs[i].call_floor;
+
+        // 탑승 전이면 방향 일치 여부도 확인
+        if (!reqs[i].picked_up && reqs[i].direction != dir) continue;
+
+        if (dir == 1 && target >= cur) {
+            if (best == -1 || target < best) best = target;
+        } else if (dir == -1 && target <= cur) {
+            if (best == -1 || target > best) best = target;
+        }
+    }
+    return best;
+}
+
+int main(void) {
+    srand(time(NULL));
+
+    int current_floor = 1;
+    int direction = 1;  
+    int total = 3;     //요청수
+
+    Request reqs[3]; // 0 1 2
+
+    printf("=== 엘리베이터 SCAN 시뮬레이션 ===\n\n");
+    printf("[IDLE] 엘리베이터 대기 중...\n\n");
+
+    // 사용자 입력
+    int user_call, user_dest, user_dir_input;
+    printf("사용자 호출 층 입력 (현재 8층 고정): ");
+    user_call = 8;
+    printf("8\n");
+
+    printf("방향 입력 (1: 상승 / -1: 하강): ");
+    scanf("%d", &user_dir_input);
+
+    printf("탑승 후 행선 층 입력: ");
+    scanf("%d", &user_dest);
+
+    reqs[0].call_floor  = user_call;
+    reqs[0].dest_floor  = user_dest;
+    reqs[0].direction   = user_dir_input;
+    reqs[0].picked_up   = 0;
+    reqs[0].done        = 0;
+
+    // 랜덤 요청 2건 생성 (호출 층, 행선 층, 방향 모두 겹치지 않게)
+    int used_floors[10];
+    int uf_count = 0;
+    used_floors[uf_count++] = user_call;
+    used_floors[uf_count++] = user_dest;
+
+    for (int p = 1; p <= 2; p++) {
+        int cf, df, dr;
+
+        // 호출 층 결정
+        do {
+            cf = (rand() % 15) + 1;
+            int dup = 0;
+            for (int k = 0; k < uf_count; k++)
+                if (used_floors[k] == cf) { dup = 1; break; }
+            if (!dup) break;
+        } while (1);
+        used_floors[uf_count++] = cf;
+
+        // 행선 층 결정
+        do {
+            df = (rand() % 15) + 1;
+            int dup = 0;
+            for (int k = 0; k < uf_count; k++)
+                if (used_floors[k] == df) { dup = 1; break; }
+            if (!dup) break;
+        } while (1);
+        used_floors[uf_count++] = df;
+
+        dr = (df > cf) ? 1 : -1;
+
+        reqs[p].call_floor  = cf;
+        reqs[p].dest_floor  = df;
+        reqs[p].direction   = dr;
+        reqs[p].picked_up   = 0;
+        reqs[p].done        = 0;
+    }
+
+    printf("\n[호출 발생]\n");
+    printf("  사용자  : %d층 호출, 방향 %s, 행선 %d층\n",
+           reqs[0].call_floor, dir_str(reqs[0].direction), reqs[0].dest_floor);
+    printf("  person1 : %d층 호출, 방향 %s, 행선 %d층\n",
+           reqs[1].call_floor, dir_str(reqs[1].direction), reqs[1].dest_floor);
+    printf("  person2 : %d층 호출, 방향 %s, 행선 %d층\n\n",
+           reqs[2].call_floor, dir_str(reqs[2].direction), reqs[2].dest_floor);
+
+    // SCAN 메인 루프
+    while (has_remaining(reqs, total)) {
+
+        int target = next_target(reqs, total, current_floor, direction);
+
+        // 현재 방향에 목표가 없으면 방향 전환
+        if (target == -1) {
+            direction = -direction;
+            printf("[방향 전환] 이제 %s 방향으로 이동합니다.\n\n", dir_str(direction));
+            target = next_target(reqs, total, current_floor, direction);
+        }
+
+        if (target == -1) break; // 남은 요청 없음 (안전 탈출)
+
+        // target 층까지 한 층씩 이동
+        while (current_floor != target) {
+            current_floor += direction;
+            printf("  %s 중: %d층\n", dir_str(direction), current_floor);
+        }
+
+        // 해당 층에서 처리할 요청 확인
+        printf("\n[%d층 정차]\n", current_floor);
+
+        // 탑승 처리 (call_floor 일치 + 방향 일치 + 아직 탑승 전)
+        for (int i = 0; i < total; i++) {
+            if (!reqs[i].done && !reqs[i].picked_up
+                && reqs[i].call_floor == current_floor
+                && reqs[i].direction == direction) {
+                reqs[i].picked_up = 1;
+                const char* name = (i == 0) ? "사용자" : (i == 1) ? "person1" : "person2";
+                printf("  >> %s 탑승 (행선 층: %d층)\n", name, reqs[i].dest_floor);
+            }
+        }
+
+        // 하차 처리 (dest_floor 일치 + 탑승 완료)
+        for (int i = 0; i < total; i++) {
+            if (!reqs[i].done && reqs[i].picked_up
+                && reqs[i].dest_floor == current_floor) {
+                reqs[i].done = 1;
+                const char* name = (i == 0) ? "사용자" : (i == 1) ? "person1" : "person2";
+                printf("  >> %s 하차\n", name);
+            }
+        }
+        printf("\n");
+    }
+
+    printf("[IDLE] 모든 요청 완료. 엘리베이터를 종료합니다.\n");
+    return 0;
+}
