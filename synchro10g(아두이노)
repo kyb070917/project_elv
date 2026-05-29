@@ -1,0 +1,472 @@
+#include <Arduino.h>
+#include <Arduino_LED_Matrix.h>
+#include <U8g2lib.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ================= LED MATRIX =================
+ArduinoLEDMatrix matrix;
+
+uint8_t nine[8][12] = {
+  {0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0},
+  {0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0},
+  {0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0},
+  {0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0},
+  {0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+};
+
+// ================= OLED =================
+U8G2_SSD1309_128X64_NONAME0_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// ================= LCD =================
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// ================= 버튼 설정 =================
+#define BUTTON_COUNT 9
+
+const int buttonPins[BUTTON_COUNT] =
+{2, 3, 4, 5, 6, 7, 8, 9, 10};
+bool buttonPrevState[BUTTON_COUNT] = {false};
+
+// ================= 설정 =================
+#define ARROW_COUNT 3
+#define ARROW_GAP   34
+
+float arrowY[ARROW_COUNT];
+
+// ================= 상태 정의 =================
+#define STATE_MOVING  0
+#define STATE_DOOR    1
+#define STATE_IDLE    2
+
+int currentState = STATE_IDLE;
+
+// ================= 계단 vs 엘리베이터 =================
+// ETA_USER: 8층 → 3층 (5개 층 차이 × 6.0초/층)
+#define STAIR_TIME 30.0f
+
+// ================= 시리얼 상태 =================
+int   currentFloor = 1;
+int   currentDir   = 1;
+float etaValue     = -1.0;
+bool  dataUpdated  = false;
+
+int prevDir = 1;
+
+char serialBuf[64];
+int  serialIdx = 0;
+
+bool pcConnected = false;
+unsigned long lastRecvTime = 0;
+
+// ================= 버튼 플래시 상태 =================
+int  btnFlashNum  = 0;
+bool btnFlashing  = false;
+unsigned long btnFlashTime = 0;
+#define BTN_FLASH_MS 2000
+
+// ================= 함수 선언 =================
+void updateLCD();
+void animateDoorOpen();
+void animateDoorClose();
+void etaBoardingAnimation();
+
+// ================= 문 애니메이션 =================
+void drawDoor(int openPx) {
+    u8g2.setFont(u8g2_font_logisoso32_tr);
+    u8g2.setCursor(8, 48);
+    u8g2.print(currentFloor);
+    u8g2.print("F");
+
+    int centerX = 98;
+    int doorW = 12;
+    int doorH = 40;
+    int doorY = 12;
+    int offset = openPx / 2;
+    int leftX  = centerX - doorW - offset;
+    int rightX = centerX + offset;
+
+    u8g2.drawBox(leftX,  doorY, doorW, doorH);
+    u8g2.drawBox(rightX, doorY, doorW, doorH);
+}
+
+void animateDoorOpen() {
+    for (int px = 0; px <= 24; px += 2) {
+        u8g2.clearBuffer();
+        drawDoor(px);
+        u8g2.sendBuffer();
+        delay(20);
+    }
+}
+
+void etaBoardingAnimation() {
+
+    for (int x = 18; x <= 78; x += 3) {
+
+        u8g2.clearBuffer();
+
+        // ===== 층 표시 =====
+        u8g2.setFont(u8g2_font_logisoso32_tr);
+        u8g2.setCursor(8, 48);
+        u8g2.print(currentFloor);
+        u8g2.print("F");
+
+        // ===== 문 =====
+        int doorX = 98;
+        int doorY = 12;
+        int doorW = 12;
+        int doorH = 40;
+
+        u8g2.drawFrame(doorX - doorW, doorY, doorW, doorH);
+        u8g2.drawFrame(doorX,         doorY, doorW, doorH);
+
+        // ===== 졸라맨 =====
+
+        // 머리
+        u8g2.drawCircle(x, 24, 4);
+
+        // 몸
+        u8g2.drawLine(x, 28, x, 38);
+
+        // 팔
+        u8g2.drawLine(x, 30, x - 5, 34);
+        u8g2.drawLine(x, 30, x + 5, 34);
+
+        // 다리
+        u8g2.drawLine(x, 38, x - 5, 46);
+        u8g2.drawLine(x, 38, x + 5, 46);
+
+        u8g2.sendBuffer();
+
+        delay(35);
+    }
+
+    // ===== 문 흡수 효과 =====
+
+    for (int i = 0; i < 3; i++) {
+
+        u8g2.clearBuffer();
+
+        u8g2.drawBox(84, 10, 28, 44);
+
+        u8g2.sendBuffer();
+
+        delay(50);
+
+        u8g2.clearBuffer();
+        u8g2.sendBuffer();
+
+        delay(50);
+    }
+
+    // ===== 화면 정상 복귀 =====
+    dataUpdated = true;
+}
+
+
+
+
+void animateDoorClose() {
+    for (int px = 24; px >= 0; px -= 2) {
+        u8g2.clearBuffer();
+        drawDoor(px);
+        u8g2.sendBuffer();
+        delay(20);
+    }
+}
+
+// ================= 시리얼 파싱 =================
+void parseSerial(char* line) {
+    if (strcmp(line, "HELLO") == 0) {
+        pcConnected = true;
+        lastRecvTime = millis();
+
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("  === ELEVATOR ===");
+        lcd.setCursor(0, 1);
+        lcd.print("PC Connected!");
+        lcd.setCursor(0, 2);
+        lcd.print("System Check...");
+
+        u8g2.clearBuffer();
+        u8g2.setFont(u8g2_font_logisoso32_tr);
+        u8g2.setCursor(0, 42);
+        u8g2.print("88F");
+        u8g2.drawBox(92, 0, 28, 64);
+        u8g2.sendBuffer();
+        delay(3000);
+
+        u8g2.clearBuffer();
+        u8g2.setFont(u8g2_font_10x20_tr);
+        u8g2.drawStr(10, 28, "PANEL");
+        u8g2.drawStr(10, 54, "CHECK");
+        u8g2.sendBuffer();
+        delay(3000);
+
+        updateLCD();
+        return;
+    }
+
+    if (strcmp(line, "EVENT:ETA") == 0) {
+
+        etaBoardingAnimation();
+
+        return;
+    }
+    int f, d, e10, s;
+    if (sscanf(line, "F:%d,D:%d,E:%d,S:%d", &f, &d, &e10, &s) == 4) {
+        currentFloor = f;
+        currentDir   = d;
+        etaValue = (e10 >= 0) ? (e10 / 10.0f) : -1.0f;
+
+        int prevState = currentState;
+        currentState = s;
+
+        if (prevState != STATE_DOOR && currentState == STATE_DOOR)
+            animateDoorOpen();
+        else if (prevState == STATE_DOOR && currentState != STATE_DOOR)
+            animateDoorClose();
+
+        dataUpdated = true;
+        pcConnected = true;
+        lastRecvTime = millis();
+    }
+}
+
+// ================= 버튼 처리 =================
+void checkButtons() {
+
+    for (int i = 0; i < BUTTON_COUNT; i++) {
+
+        bool cur = digitalRead(buttonPins[i]);
+
+        if (buttonPrevState[i] == false &&
+            cur == true) {
+
+            // ===== D2 START 버튼 =====
+            if (i == 0) {
+
+                Serial.println("CMD:START");
+
+                lcd.clear();
+                lcd.setCursor(0,1);
+                lcd.print("SYSTEM START");
+
+                btnFlashing  = true;
+                btnFlashTime = millis();
+            }
+
+            // ===== 일반 층 버튼 =====
+            else {
+
+                Serial.print("BTN:");
+                Serial.println(i + 1);
+            }
+        }
+
+        buttonPrevState[i] = cur;
+    }
+
+    delay(20);
+}
+
+// ================= LCD =================
+void updateLCD() {
+    if (!pcConnected) {
+        lcd.setCursor(0, 0);
+        lcd.print("=== ELEVATOR ===");
+        lcd.setCursor(0, 1);
+        lcd.print("Waiting   ");
+        lcd.setCursor(0, 2);
+        lcd.print("Serial ?   ");
+        lcd.setCursor(0, 3);
+        lcd.print("NO VSC   ");
+        return;
+    }
+
+    lcd.setCursor(0, 0);
+    lcd.print("=== ELEVATOR === ");
+    lcd.setCursor(0, 1);
+    lcd.print("Floor : ");
+    lcd.print(currentFloor);
+    lcd.print("   ");
+    lcd.setCursor(0, 2);
+    lcd.print("ETA   : ");
+    if (etaValue >= 0) {
+        lcd.print((int)etaValue);
+        lcd.print(" sec   ");
+    } else {
+        lcd.print("---      ");
+    }
+
+    // ================= 4번째 줄: 계단/엘베 권고 =================
+    lcd.setCursor(0, 3);
+    if (currentDir == 0) {
+        lcd.print("[IDLE]              ");
+    } else if (etaValue < 0) {
+        // ETA 없음 (탑승 후 or 아직 계산 전): 방향만 표시
+        if (currentDir == 1)
+            lcd.print("[Going Up]          ");
+        else
+            lcd.print("[Going Down]        ");
+    } else if (etaValue < STAIR_TIME) {
+        lcd.print(">> USE ELEVATOR     ");
+    } else {
+        lcd.print(">> USE STAIRS       ");
+    }
+}
+
+// ================= 화살표 =================
+void drawArrowUp(int x, int y) {
+    u8g2.drawTriangle(x, y, x - 10, y + 12, x + 10, y + 12);
+    u8g2.drawBox(x - 4, y + 12, 8, 16);
+}
+
+void drawArrowDown(int x, int y) {
+    u8g2.drawTriangle(x, y + 28, x - 10, y + 16, x + 10, y + 16);
+    u8g2.drawBox(x - 4, y, 8, 16);
+}
+
+// ================= SETUP =================
+void setup() {
+    for (int r = 0; r < 8; r++) {
+        for (int c = 11; c > 0; c--)
+            nine[r][c] = nine[r][c - 1];
+        nine[r][0] = 0;
+    }
+    matrix.begin();
+    matrix.renderBitmap(nine, 8, 12);
+
+    for (int i = 0; i < BUTTON_COUNT; i++)
+        pinMode(buttonPins[i], INPUT);
+
+    Serial.begin(9600);
+    delay(300);
+
+    u8g2.begin();
+    lcd.init();
+    lcd.backlight();
+
+    for (int i = 0; i < ARROW_COUNT; i++)
+        arrowY[i] = 64.0 + (i * ARROW_GAP);
+
+    updateLCD();
+}
+
+// ================= LOOP =================
+void loop() {
+    // 버튼 체크
+    checkButtons();
+
+    // 통신 끊김
+    if (pcConnected && millis() - lastRecvTime > 5000) {
+        pcConnected = false;
+        updateLCD();
+    } 
+
+    // 시리얼 수신
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\n') {
+            serialBuf[serialIdx] = '\0';
+            parseSerial(serialBuf);
+            serialIdx = 0;
+        } else {
+            if (serialIdx < (int)sizeof(serialBuf) - 1)
+                serialBuf[serialIdx++] = c;
+        }
+    }
+
+    // LCD 갱신
+    if (btnFlashing && millis() - btnFlashTime >= BTN_FLASH_MS) {
+        btnFlashing = false;
+        lcd.clear();
+        updateLCD();
+    }
+
+    if (dataUpdated && !btnFlashing) {
+        updateLCD();
+        dataUpdated = false;
+    }
+
+    // 방향 변경
+    if (currentDir != prevDir) {
+        for (int i = 0; i < ARROW_COUNT; i++) {
+            if (currentDir == 1)
+                arrowY[i] = 64.0 + (i * ARROW_GAP);
+            else if (currentDir == -1)
+                arrowY[i] = -20.0 - (i * ARROW_GAP);
+        }
+        prevDir = currentDir;
+    }
+
+    // OLED
+    u8g2.clearBuffer();
+
+    if (!pcConnected) {
+        u8g2.setFont(u8g2_font_logisoso24_tr);
+        u8g2.setCursor(10, 34);
+        u8g2.print("serial ?");
+        u8g2.setFont(u8g2_font_6x12_tr);
+        u8g2.drawStr(12, 58, "Waiting for PC");
+        u8g2.sendBuffer();
+        delay(50);
+        return;
+    }
+
+    if (currentState == STATE_DOOR) {
+        drawDoor(24);
+        u8g2.sendBuffer();
+        delay(16);
+        return;
+    }
+
+    u8g2.setFont(u8g2_font_logisoso32_tr);
+    u8g2.setCursor(8, 48);
+    u8g2.print(currentFloor);
+    u8g2.print("F");
+
+    bool showArrow = (currentDir != 0);
+    if (showArrow) {
+        for (int i = 0; i < ARROW_COUNT; i++) {
+            if (arrowY[i] > -30 && arrowY[i] < 80) {
+                if (currentDir == 1)
+                    drawArrowUp(98, (int)arrowY[i]);
+                else
+                    drawArrowDown(98, (int)arrowY[i]);
+            }
+        }
+    }
+
+    u8g2.setFont(u8g2_font_6x12_tr);
+    if (currentDir == 0)
+        u8g2.drawStr(8, 62, "IDLE");
+    else if (currentDir == 1)
+        u8g2.drawStr(8, 62, "GOING UP");
+    else
+        u8g2.drawStr(8, 62, "GOING DOWN");
+
+    u8g2.sendBuffer();
+
+    if (showArrow) {
+        float speed = (currentDir == 1) ? 0.75 : -0.75;
+        for (int i = 0; i < ARROW_COUNT; i++) {
+            arrowY[i] -= speed;
+            float maxY = arrowY[0], minY = arrowY[0];
+            for (int j = 1; j < ARROW_COUNT; j++) {
+                if (arrowY[j] > maxY) maxY = arrowY[j];
+                if (arrowY[j] < minY) minY = arrowY[j];
+            }
+            if (currentDir == 1 && arrowY[i] < -30)
+                arrowY[i] = maxY + ARROW_GAP;
+            else if (currentDir == -1 && arrowY[i] > 94)
+                arrowY[i] = minY - ARROW_GAP;
+        }
+    }
+
+    delay(16);
+}
